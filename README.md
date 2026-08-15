@@ -1,6 +1,6 @@
 # Ethereum TV Algorithm
 
-The recommendation algorithm behind [Ethereum TV](https://ethereum.tv), open sourced.
+The recommendation algorithm behind [Ethereum TV](https://ethereumtv.co/), open sourced.
 
 Every talk page on Ethereum TV shows a set of related talks. This repository is the scoring model that chooses and orders them: the reasoning behind it, the exact maths, and a reference implementation you can run and adapt. It is built for a searchable archive of conference talks, but the approach carries over to any catalog where items share structured signals (tags, authors, events) and carry engagement data (views, likes).
 
@@ -15,7 +15,7 @@ The naive version of this is "show the most popular talks." It is easy and it is
 So the design starts from two beliefs:
 
 1. **Relevance decides who is eligible. Popularity only decides the order among the relevant.** A wildly popular but unrelated talk should never appear next to a talk it has nothing to do with.
-2. **Quality is not the same as reach.** A talk with 3,000 views and a great like-to-view ratio is often a better recommendation than a talk with 300,000 views and a mediocre one. The engine should be able to find those, because that discovery is the value the platform adds.
+2. **Quality is not the same as reach.** A talk with 3,000 views and a great like-to-view ratio is often a better recommendation than a talk with 30,000 views and a mediocre one. The engine should be able to find those, because that discovery is the value the platform adds.
 
 ## The model
 
