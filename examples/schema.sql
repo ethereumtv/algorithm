@@ -24,6 +24,10 @@ create table if not exists events (
 create table if not exists items (
   id uuid primary key default gen_random_uuid(),
   published boolean not null default false,
+  -- v1.1: catalogs mixing types with very different audience sizes (talks
+  -- next to podcast episodes) tag each item; statistics are computed within
+  -- each type. A single-type catalog can ignore this column entirely.
+  content_type text not null default 'default',
   primary_topic_id uuid references topics (id),
   event_id uuid references events (id),
   format_id uuid,                 -- opaque: keynote, workshop, panel, ...

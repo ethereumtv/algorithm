@@ -17,11 +17,11 @@
 --
 --   Quality Q(B) in [0, 1]  reorders the eligible set.
 --     resonance  Bayesian-smoothed like/view percentile (m = 2000 pseudo-views
---                toward the catalog median rate C; hidden-like items sit at C)
+--                toward the per-type median rate C; hidden-like items sit at C)
 --     reach      log-view percentile
---     freshness  0.4 + 0.6 * exp(-age_days / 540), floored so evergreen survives
+--     freshness  floor + (1 - floor) * exp(-age_days / tau), per content type
 --     gem        resonance * (1 - reach), lifts under-viewed quality
---     Q = 0.35*resonance + 0.30*reach + 0.15*freshness + 0.20*gem
+--     Q = w_resonance*resonance + w_reach*reach + w_freshness*freshness + w_gem*gem
 --
 --   score(A, B) = R(A, B) * (1 + 0.6 * Q(B))
 --
@@ -29,12 +29,27 @@
 -- the score is 0, so quality can never manufacture a relationship. See the
 -- README for the full reasoning behind every weight.
 --
+-- MIXING CONTENT TYPES (v1.1). Catalogs that mix types with wildly different
+-- audience sizes (conference talks next to podcast episodes) break a shared
+-- distribution: the high-view type occupies the whole top of every percentile
+-- and Q degrades into a content-type detector. So:
+--   * reach, resonance, and the prior C are computed WITHIN each content type;
+--   * freshness shape and Q weights are per type. The secondary type here
+--     ('episode') gets a short novelty spike (floor 0.25, tau 12 days) and
+--     shifts 0.10 of Q weight from reach to freshness, so timely content
+--     surfaces while fresh and is then carried by resonance + gem alone;
+--   * on a primary-type anchor at most `secondary_rail_cap` secondary-type
+--     rows survive (admitted by score like everything else); the secondary
+--     type's own anchors carry no cap.
+-- With a single content type in the catalog all three changes are no-ops.
+--
 -- Candidate generation uses only the selective signals (shared subtopic,
 -- contributor, network). Broad top-level topics, event, format, and the
 -- primary-topic match are decorations on pairs that already exist, never
 -- generators, so a hub topic on hundreds of items cannot explode the pair
 -- space. No empty states: any item with fewer than six genuine matches is
--- topped up from a resonance-ranked global pool.
+-- topped up from a resonance-ranked global pool (primary-type items only, so
+-- the serendipity slots keep the catalog's identity).
 --
 -- Portability note: this reference version is plain SECURITY INVOKER SQL so it
 -- runs on any Postgres (see examples/). On a multi-tenant deployment such as
@@ -59,14 +74,27 @@ language plpgsql
 as $$
 declare
   n integer;
+  -- v1.1 tunables, declared once. 'default' covers every content type without
+  -- its own row in the params CTE below.
+  secondary_type constant text := 'episode';
+  secondary_rail_cap constant integer := 2;
 begin
   -- DELETE, not TRUNCATE, so concurrent readers keep MVCC visibility of the
   -- previous set through the whole recompute (never a briefly-empty result).
   delete from related_items;
 
-  with pub as (
+  with params as (
+    -- content_type, freshness floor, freshness tau (days), w_reach, w_freshness.
+    -- w_resonance is 0.35 and w_gem 0.20 for every type.
+    select * from (values
+      ('default', 0.40, 540.0, 0.30, 0.15),
+      ('episode', 0.25, 12.0, 0.20, 0.25)
+    ) as v(content_type, fresh_floor, fresh_tau, w_reach, w_fresh)
+  ),
+  pub as (
     select
       i.id,
+      coalesce(i.content_type, 'default') as content_type,
       coalesce(i.view_count, 0)::numeric as views,
       i.like_count as likes,
       coalesce(i.published_at, e.start_date) as eff_date,
@@ -77,42 +105,61 @@ begin
     left join events e on e.id = i.event_id
     where i.published
   ),
+  -- The like-rate smoothing prior C, per content type: distributions differ
+  -- between types, and a shared median would shrink both toward the wrong
+  -- center.
   consts as (
-    select coalesce(
-      percentile_cont(0.5) within group (
-        order by (p.likes::numeric / nullif(p.views, 0))
-      ) filter (where p.likes is not null and p.views > 0),
-      0
-    ) as c
+    select
+      p.content_type,
+      coalesce(
+        percentile_cont(0.5) within group (
+          order by (p.likes::numeric / nullif(p.views, 0))
+        ) filter (where p.likes is not null and p.views > 0),
+        0
+      ) as c
     from pub p
+    group by p.content_type
   ),
   qual as (
     select
       p.id,
+      p.content_type,
       p.primary_topic_id,
       p.event_id,
       p.format_id,
-      percent_rank() over (order by ln(1 + p.views)) as reach,
+      -- Percentiles WITHIN the row's content type (v1.1 core fix).
       percent_rank() over (
+        partition by p.content_type order by ln(1 + p.views)
+      ) as reach,
+      percent_rank() over (
+        partition by p.content_type
         order by (coalesce(p.likes, cn.c * p.views) + 2000 * cn.c) / (p.views + 2000)
       ) as resonance,
-      0.4 + 0.6 * exp(
-        -greatest(current_date - coalesce(p.eff_date, current_date - 3650), 0) / 540.0
-      ) as freshness
+      pr.fresh_floor + (1 - pr.fresh_floor) * exp(
+        -greatest(current_date - coalesce(p.eff_date, current_date - 3650), 0)
+          / pr.fresh_tau
+      ) as freshness,
+      pr.w_reach,
+      pr.w_fresh
     from pub p
-    cross join consts cn
+    join consts cn on cn.content_type = p.content_type
+    join params pr on pr.content_type = coalesce(
+      (select p2.content_type from params p2 where p2.content_type = p.content_type),
+      'default'
+    )
   ),
   qfinal as (
     select
       id,
+      content_type,
       primary_topic_id,
       event_id,
       format_id,
       resonance,
       (
         0.35 * resonance
-        + 0.30 * reach
-        + 0.15 * freshness
+        + w_reach * reach
+        + w_fresh * freshness
         + 0.20 * (resonance * (1 - reach))
       )::numeric as qv
     from qual
@@ -181,6 +228,8 @@ begin
       coalesce(st.shared_top, 0) as shared_top,
       (gc.a_id is not null) as shares_contributor,
       (gn.a_id is not null) as shares_network,
+      qa.content_type as a_type,
+      qb.content_type as b_type,
       qa.primary_topic_id as a_primary,
       qb.primary_topic_id as b_primary,
       qa.event_id as a_event,
@@ -200,6 +249,8 @@ begin
     select
       a_id,
       b_id,
+      a_type,
+      b_type,
       b_q,
       (
         4.0 * least(shared_sub, 3)
@@ -212,17 +263,42 @@ begin
       ) as r
     from scored
   ),
+  prelim as (
+    select
+      a_id,
+      b_id,
+      a_type,
+      b_type,
+      r * (1 + 0.6 * b_q) as score_num,
+      -- Rank within (anchor, is-candidate-secondary) so the cap below keeps
+      -- the BEST-scoring secondary-type rows, not arbitrary ones.
+      row_number() over (
+        partition by a_id, (b_type = secondary_type)
+        order by r * (1 + 0.6 * b_q) desc, b_id
+      ) as type_rank
+    from relevance
+    where r > 0
+  ),
+  -- v1.1 cap: on a primary-type anchor at most secondary_rail_cap
+  -- secondary-type rows survive; a secondary-type anchor keeps its own kind
+  -- uncapped.
+  capped as (
+    select a_id, b_id, score_num
+    from prelim
+    where a_type = secondary_type
+      or b_type <> secondary_type
+      or type_rank <= secondary_rail_cap
+  ),
   ranked as (
     select
       a_id,
       b_id,
-      (r * (1 + 0.6 * b_q))::real as score,
+      score_num::real as score,
       row_number() over (
         partition by a_id
-        order by r * (1 + 0.6 * b_q) desc, b_id
+        order by score_num desc, b_id
       ) as rank
-    from relevance
-    where r > 0
+    from capped
   ),
   genuine as (
     select a_id, b_id, score, rank
@@ -232,6 +308,8 @@ begin
   -- No empty states: top up items with fewer than six genuine matches from a
   -- pool ranked by RESONANCE (the hidden-gem signal), not raw views, so even
   -- the tail surfaces quality rather than the same few most-viewed items.
+  -- Primary-type items only (v1.1): the filler slots keep the catalog's
+  -- identity.
   need as (
     select p.id as a_id, coalesce(g.cnt, 0) as have, coalesce(g.maxrank, 0) as maxrank
     from pub p
@@ -245,6 +323,7 @@ begin
   pool as (
     select id, qv, resonance
     from qfinal
+    where content_type <> secondary_type
     order by resonance desc, qv desc, id
     limit 50
   ),

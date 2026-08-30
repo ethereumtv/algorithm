@@ -60,7 +60,7 @@ Q(B) = 0.35 * resonance
      + 0.20 * gem
 ```
 
-**resonance** is the like-to-view ratio, expressed as a percentile rank across the catalog. This is the signal that rewards a talk for resonating with the people who watched it, regardless of how many that was. It is the hidden-gem lever.
+**resonance** is the like-to-view ratio, expressed as a percentile rank across the catalog (since v1.1, across the items of the same content type; see [Mixing content types](#mixing-content-types-v11)). This is the signal that rewards a talk for resonating with the people who watched it, regardless of how many that was. It is the hidden-gem lever.
 
 Raw like-to-view ratios are treacherous at low view counts. A talk with 12 views and 5 likes has a ratio of 0.42, which is meaningless. So the ratio is smoothed toward the catalog median with a pseudo-count, a standard Bayesian shrinkage:
 
@@ -103,6 +103,25 @@ A note on the weights: `gem` re-uses `resonance`, on purpose. Add the two terms 
 Relevance is the primary axis and quality is the secondary one. Concretely, a candidate that shares a subtopic, a speaker, and the primary topic might have `R = 12`, while a candidate that only shares a broad top-level topic might have `R = 1.5`. No value of `Q`, which can lift a score by at most 60 percent, lets the second overtake the first. Within a tier of similarly relevant candidates, `Q` is what orders them, and there the resonance and gem terms make sure a quiet high-quality talk is not automatically beaten by a loud one.
 
 The score is directional. `score(A, B)` uses `B`'s quality, because when we rank the talks shown next to `A`, what matters is how good each candidate `B` is. The reverse list, the talks shown next to `B`, is ranked by `A`'s quality. The relevance component is symmetric; only the quality prior differs by direction.
+
+### Mixing content types (v1.1)
+
+Ethereum TV added podcast episodes next to conference talks, and that broke an assumption the maths had been quietly making: that every item in the catalog plays the same statistical game. A popular podcast episode carries 10 to 100 times the views of a median conference talk. Pour both into one distribution and the episodes occupy the entire top of the reach percentiles, every talk gets compressed toward the bottom, and the "quality" prior turns into a content-type detector. Three changes fix this, and together they are v1.1.
+
+**Partition the statistics by content type.** `reach` and `resonance` become percentile ranks within the item's own content type, and the smoothing prior `C` is a per-type median. An episode's reach is its rank among episodes; a talk's is its rank among talks. `Q` stays comparable across types by construction, `gem` keeps working within each type, and no relevance weight changes. This is the core fix, and it is cheap: the window functions gain a `partition by content_type` and the median gains a `group by`.
+
+**Per-type freshness, shaped to the content.** The value of podcast content is bimodal: news and commentary episodes matter for a week or two and little after, while a good interview is evergreen. No single decay curve expresses that, and classifying episodes editorially does not scale, because most shows publish both kinds. So episode freshness is a short novelty spike rather than a slower version of the talk curve:
+
+```
+talks:     0.40 + 0.60 * exp( -age_in_days / 540 )
+episodes:  0.25 + 0.75 * exp( -age_in_days / 12 )
+```
+
+A new episode scores near 1.0, is at roughly 0.68 after a week, and sits on the 0.25 floor within a month. From then on the ordering among episodes is carried entirely by resonance and gem, so evergreen episodes distinguish themselves through engagement rather than age, with no news-versus-evergreen flag anywhere in the system. Episode `Q` also shifts 0.10 of weight from reach to freshness (`0.35 resonance + 0.20 reach + 0.25 freshness + 0.20 gem`), which makes the spike bite while further muting raw view counts for the type that has too many of them.
+
+**Cap the minority type on the majority's rails.** Even with honest statistics, a strongly related episode can earn a talk-page slot on merit, and it should. But a talk page whose rail is half podcast episodes stops feeling like an archive of talks. So on a talk anchor at most 2 of the stored related items are episodes, admitted by score like everything else; an episode's own rail carries no cap, because related episodes are expected there. Items that should never appear on mixed surfaces at all (Ethereum TV's community calls) are excluded from scoring entirely, as anchors and as candidates.
+
+The reference implementation keeps the per-type constants declared in one place at the top of the function, because they are opinions you will want to tune, not facts.
 
 ## How it is computed
 
