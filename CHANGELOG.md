@@ -21,6 +21,11 @@ into a content-type detector.
   storage time.
 - `items.content_type` added to the example schema (default 'default'; a
   single-type catalog behaves exactly as v1.0).
+- The full-table DELETE now reads `delete from related_items where true`:
+  managed platforms that enforce a safe-update guard (Supabase invoking the
+  refresh via PostgREST rpc, for instance) reject the unfiltered form, and
+  the failure is silent from the caller's side. Identical semantics
+  everywhere else.
 
 ## v1.0 (2026-08-15)
 

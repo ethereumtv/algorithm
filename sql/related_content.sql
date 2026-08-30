@@ -81,7 +81,10 @@ declare
 begin
   -- DELETE, not TRUNCATE, so concurrent readers keep MVCC visibility of the
   -- previous set through the whole recompute (never a briefly-empty result).
-  delete from related_items;
+  -- The `where true` is deliberate: managed platforms (e.g. Supabase, when
+  -- this runs via a PostgREST rpc) enforce a safe-update guard that rejects
+  -- an unfiltered DELETE; this form satisfies it with identical semantics.
+  delete from related_items where true;
 
   with params as (
     -- content_type, freshness floor, freshness tau (days), w_reach, w_freshness.
