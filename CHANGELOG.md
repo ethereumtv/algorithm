@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.2 (2026-08-31)
+
+- Stored ranks per item raised from 12 to 16. Consumers that reserve a
+  prefix of the ranking for one surface (Ethereum TV reserves ranks 1 to 9
+  as the watch-page rail's fill pool) still have a genuine pool left for a
+  second surface, such as a More-like-this shelf, after deduplicating
+  against items already on screen. Scoring is unchanged.
+
 ## v1.1 (2026-08-30)
 
 Mixing content types without letting one dominate. Ethereum TV added podcast

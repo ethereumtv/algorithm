@@ -306,7 +306,11 @@ begin
   genuine as (
     select a_id, b_id, score, rank
     from ranked
-    where rank <= 12
+    -- 16 stored ranks per item (v1.2): consumers that reserve a prefix of
+    -- the ranking for one surface (ETV reserves 1..9 for the watch-page
+    -- rail) still have a real pool left for a second surface such as a
+    -- More-like-this shelf, after deduplication.
+    where rank <= 16
   ),
   -- No empty states: top up items with fewer than six genuine matches from a
   -- pool ranked by RESONANCE (the hidden-gem signal), not raw views, so even
