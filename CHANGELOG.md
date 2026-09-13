@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.3 (2026-09-13)
+
+- Sparse-item top-up raised from 6 to 13 rows. This supplies enough ranked,
+  deduplicated candidates for a nine-item rail and an independently reserved
+  four-item shelf, while the existing 16-row cap keeps deduplication headroom.
+- Refresh guidance now recommends an independent schedule so an upstream
+  statistics-sync failure cannot leave newly published items without rows.
+
 ## v1.2 (2026-08-31)
 
 - Stored ranks per item raised from 12 to 16. Consumers that reserve a
