@@ -1,8 +1,8 @@
 -- Ethereum TV Algorithm: related-content scoring.
 --
 -- One SQL function that precomputes, for every published item, an ordered set
--- of related items into `related_items`. Run it on a schedule (Ethereum TV
--- runs it every six hours, right after refreshing view and like counts).
+-- of related items into `related_items`. Run it on a schedule. Ethereum TV
+-- marks catalog/statistics changes dirty and checks that state every five minutes.
 --
 -- The score has two axes that are kept deliberately separate:
 --
@@ -47,7 +47,7 @@
 -- contributor, network). Broad top-level topics, event, format, and the
 -- primary-topic match are decorations on pairs that already exist, never
 -- generators, so a hub topic on hundreds of items cannot explode the pair
--- space. No empty states: any item with fewer than six genuine matches is
+-- space. No empty states: any item with fewer than thirteen genuine matches is
 -- topped up from a resonance-ranked global pool (primary-type items only, so
 -- the serendipity slots keep the catalog's identity).
 --
@@ -306,13 +306,13 @@ begin
   genuine as (
     select a_id, b_id, score, rank
     from ranked
-    -- 16 stored ranks per item (v1.2): consumers that reserve a prefix of
-    -- the ranking for one surface (ETV reserves 1..9 for the watch-page
-    -- rail) still have a real pool left for a second surface such as a
-    -- More-like-this shelf, after deduplication.
+    -- 16 stored ranks per item (v1.2): multi-surface consumers have enough
+    -- headroom to reserve one surface before filling another. Ethereum TV
+    -- reserves up to four unique ranks for its shelf, then uses later ranks
+    -- to fill the contextual rail after deduplication.
     where rank <= 16
   ),
-  -- No empty states: top up items with fewer than six genuine matches from a
+  -- No empty states: top up items with fewer than thirteen genuine matches from a
   -- pool ranked by RESONANCE (the hidden-gem signal), not raw views, so even
   -- the tail surfaces quality rather than the same few most-viewed items.
   -- Primary-type items only (v1.1): the filler slots keep the catalog's
@@ -325,7 +325,7 @@ begin
       from genuine
       group by a_id
     ) g on g.a_id = p.id
-    where coalesce(g.cnt, 0) < 6
+    where coalesce(g.cnt, 0) < 13
   ),
   pool as (
     select id, qv, resonance
@@ -352,7 +352,7 @@ begin
   fill as (
     select a_id, b_id, score, (maxrank + frank) as rank
     from fill_ranked
-    where frank <= 6 - have
+    where frank <= 13 - have
   ),
   combined as (
     select a_id, b_id, score, rank from genuine
