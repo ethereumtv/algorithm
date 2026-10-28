@@ -36,7 +36,9 @@ docker rm -f algo-demo   # tidy up when done
 `refresh_related_items()` returns the number of rows written, and
 `assertions.sql` completes without an exception. The assertions prove that a
 sparse anchor reaches 13 rows, a dense anchor stops at 16, ranks are contiguous
-and unique, and no item recommends itself. Then inspect the related list for
+and unique, no item recommends itself, top-up starts with the anchor's own
+context, no podcast host holds more than 2 of an episode's top 4 rows, a host
+alone makes no match, and a talk page holds at most two episodes. Then inspect the related list for
 item `p1` (a privacy talk):
 
 ```sql
@@ -63,10 +65,15 @@ contributor with `p1`, which is the single strongest relevance signal, so it
 would rank near the top even with a fraction of the views. Strip that shared
 contributor from `seed.sql` and it drops back into the pack.
 
-Ranks 6 through 13 are fillers: `p1` has only five genuinely related items, so
-later slots are topped up from the quality pool to guarantee enough rows for
-consuming surfaces. See the README for how that pool is chosen (by resonance,
-not by views).
+Ranks 6 through 13 are top-up: `p1` has only five genuinely related items. Rank
+6 is item `11`, the one other item from `p1`'s event, because top-up looks at
+the anchor's own event and topics first. The rest come from the catalog's
+best-received items, in an order that differs from anchor to anchor. See the
+README for how both tiers are chosen.
+
+The seed also holds a podcast of 105 episodes with one host. Open any episode
+(for example `ffffffff-0000-0000-0001-000000000050`) and the host's other episodes hold
+only ranks 1, 2 and 5 of the top 13; the rest wait at ranks 14 to 16.
 
 Change the numbers in `seed.sql` and re-run `refresh_related_items()` to see
 the ranking move.
