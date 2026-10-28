@@ -58,6 +58,11 @@
 -- each anchor but differs between anchors, so no single item tops every
 -- sparse page. At most 16 rows are stored per item.
 --
+-- Known boundaries: in a catalog too small to give an item four rows that
+-- pass the spread rule, ranks 1 to 4 take the next rows rather than leave a
+-- gap, and an item whose global pool is almost all blocked by the spread
+-- rule could hold fewer than 13 rows.
+--
 -- Portability note: this reference version is plain SECURITY INVOKER SQL so it
 -- runs on any Postgres (see examples/). On a multi-tenant deployment such as
 -- Supabase you would add SECURITY DEFINER, `set search_path = ''` with
