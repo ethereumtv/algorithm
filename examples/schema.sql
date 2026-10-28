@@ -18,7 +18,10 @@ create table if not exists topics (
 
 create table if not exists events (
   id uuid primary key default gen_random_uuid(),
-  start_date date
+  start_date date,
+  -- v1.4: a grouping that is not a real event (an uploads bucket, say). Its
+  -- items are not offered to each other as same-event top-up.
+  is_catch_all boolean not null default false
 );
 
 create table if not exists items (
@@ -31,7 +34,7 @@ create table if not exists items (
   primary_topic_id uuid references topics (id),
   event_id uuid references events (id),
   format_id uuid,                 -- opaque: keynote, workshop, panel, ...
-  view_count integer,
+  view_count integer,             -- null when the source has no counter (unknown)
   like_count integer,             -- null when unknown or hidden
   published_at date
 );

@@ -4,6 +4,8 @@ The recommendation algorithm behind [Ethereum TV](https://ethereumtv.co/), open 
 
 Every talk page on Ethereum TV shows a set of related talks. This repository is the scoring model that chooses and orders them: the reasoning behind it, the exact maths, and a reference implementation you can run and adapt. It is built for a searchable archive of conference talks, but the approach carries over to any catalog where items share structured signals (tags, authors, events) and carry engagement data (views, likes).
 
+**Model, not plumbing.** The ranking rules here are the ones Ethereum TV runs in production, weight for weight. What is not here is the operational code around them: how Ethereum TV schedules the rebuild, splits it into small steps so the database stays responsive, and fills in new talks between rebuilds. The reference version does the same ranking in one function call.
+
 Version 1 is a transparent heuristic. It is a week of work rather than a research project, it runs as a single SQL function, and it can be upgraded to semantic similarity later without changing the interface.
 
 ## Why this exists
@@ -47,7 +49,9 @@ The weights encode a few opinions worth stating plainly.
 
 **Sharing an ecosystem or network** (both about a given L2, both about zero knowledge) is a real relatedness axis in this domain and gets a moderate weight.
 
-**Same event and same format are weak.** Being from the same conference or both being a workshop is a mild nudge, not a reason to be recommended on its own. The dedicated "from this event" and "from this speaker" views handle those cases directly, so here they only break ties.
+**Same event and same format are weak.** Being from the same conference or both being a workshop is a mild nudge, not a reason to be recommended on its own. The dedicated "from this event" and "from this speaker" views handle those cases directly, so here they mostly break ties.
+
+**The primary topic counts twice, and we know it.** Every talk's primary topic is also one of its topics. On Ethereum TV the primary topic is always a top-level heading, so two talks with the same primary topic also share a broad topic: 3.0 + 1.5 = 4.5, slightly more than one shared subtopic. If your catalog uses a subtopic as the primary topic, it counts as a shared subtopic instead. We are measuring whether to lower the primary weight; see [Limitations](#limitations-and-what-comes-next).
 
 ### Quality: Q
 
@@ -72,13 +76,13 @@ where `C` is the median like rate across all talks that have like data, and `m =
 
 `resonance` is then the percentile rank of `smoothed_like_rate` across the catalog.
 
-**reach** is the popularity signal, `views` on a log scale, expressed as a percentile rank:
+**reach** is the popularity signal: where a talk's view count ranks among talks of the same type, as a percentile.
 
 ```
-reach(B) = percentile_rank( ln(1 + views_B) )
+reach(B) = percentile_rank( views_B )
 ```
 
-The log matters. On a linear scale a single 400,000-view talk dwarfs everything and drags the ordering. On a log scale the difference between 4,000 and 40,000 views is treated as comparable to the difference between 40,000 and 400,000, which is how people actually perceive popularity.
+A rank is what keeps popularity in proportion. On a raw count a single 400,000-view talk would dwarf everything and drag the ordering. As a rank it is simply first in line, one step above the next talk, so no viral outlier can stretch the scale for the rest. Some talks come from a source with no view counter at all (a video hosted somewhere other than YouTube, say). An unknown count is not the same as nobody watching, so those talks get the middle value, 0.5, and the percentile is computed among the talks that do have a count.
 
 **freshness** gives recent talks a bounded bonus without burying evergreen ones:
 
@@ -100,7 +104,7 @@ A note on the weights: `gem` re-uses `resonance`, on purpose. Add the two terms 
 
 ### Putting it together
 
-Relevance is the primary axis and quality is the secondary one. Concretely, a candidate that shares a subtopic, a speaker, and the primary topic might have `R = 12`, while a candidate that only shares a broad top-level topic might have `R = 1.5`. No value of `Q`, which can lift a score by at most 60 percent, lets the second overtake the first. Within a tier of similarly relevant candidates, `Q` is what orders them, and there the resonance and gem terms make sure a quiet high-quality talk is not automatically beaten by a loud one.
+Relevance is the primary axis and quality is the secondary one. Concretely, a candidate that shares a subtopic, a speaker, and the primary topic has at least `R = 12`. The weakest candidate the engine compares at all shares a single subtopic and nothing else, `R = 4`. Even a perfect `Q` lifts that to 6.4, so it can never overtake the first. Within a tier of similarly relevant candidates, `Q` is what orders them, and there the resonance and gem terms make sure a quiet high-quality talk is not automatically beaten by a loud one.
 
 The score is directional. `score(A, B)` uses `B`'s quality, because when we rank the talks shown next to `A`, what matters is how good each candidate `B` is. The reverse list, the talks shown next to `B`, is ranked by `A`'s quality. The relevance component is symmetric; only the quality prior differs by direction.
 
@@ -117,23 +121,32 @@ talks:     0.40 + 0.60 * exp( -age_in_days / 540 )
 episodes:  0.25 + 0.75 * exp( -age_in_days / 12 )
 ```
 
-A new episode scores near 1.0, is at roughly 0.68 after a week, and sits on the 0.25 floor within a month. From then on the ordering among episodes is carried entirely by resonance and gem, so evergreen episodes distinguish themselves through engagement rather than age, with no news-versus-evergreen flag anywhere in the system. Episode `Q` also shifts 0.10 of weight from reach to freshness (`0.35 resonance + 0.20 reach + 0.25 freshness + 0.20 gem`), which makes the spike bite while further muting raw view counts for the type that has too many of them.
+A new episode scores near 1.0, is at roughly 0.68 after a week and 0.31 after a month, and is close to the 0.25 floor within about six weeks. From then on the ordering among episodes is carried by resonance and gem, so evergreen episodes distinguish themselves through engagement rather than age, with no news-versus-evergreen flag anywhere in the system. Episode `Q` also shifts 0.10 of weight from reach to freshness (`0.35 resonance + 0.20 reach + 0.25 freshness + 0.20 gem`), which makes the spike bite while further muting raw view counts for the type that has too many of them.
 
-**Cap the minority type on the majority's rails.** Even with honest statistics, a strongly related episode can earn a talk-page slot on merit, and it should. But a talk page whose rail is half podcast episodes stops feeling like an archive of talks. So on a talk anchor at most 2 of the stored related items are episodes, admitted by score like everything else; an episode's own rail carries no cap, because related episodes are expected there. Items that should never appear on mixed surfaces at all (Ethereum TV's community calls) are excluded from scoring entirely, as anchors and as candidates.
+**Cap the minority type on the majority's rails.** Even with honest statistics, a strongly related episode can earn a talk-page slot on merit, and it should. But a talk page whose rail is half podcast episodes stops feeling like an archive of talks. So on a talk anchor at most 2 of the stored related items are episodes, admitted by score like everything else; an episode's own rail carries no cap, because related episodes are expected there.
 
-The reference implementation keeps the per-type constants declared in one place at the top of the function, because they are opinions you will want to tune, not facts.
+Some items should never appear in related lists at all. The reference function takes an `excluded_types` setting for them: those types are left out of scoring entirely, as anchors and as candidates. Ethereum TV excludes its community calls this way.
+
+### Spreading speakers (v1.4)
+
+A podcast host appears on every episode of their show, and a prolific speaker on dozens of talks. Left alone, sharing that one person can fill a whole list: on Ethereum TV, before v1.4, nearly half of all episode pages showed the same person on at least three of their four "More like this" cards. So at most 2 of the top 4 related items, and at most 3 of the top 13, may share any one speaker with the talk. Further items sharing that speaker are not dropped. They move down the list, behind the other related items and the top-up described below, so a long list still reaches them.
 
 ## How it is computed
 
 The scores are precomputed into a table, refreshed on a schedule, and read as plain rows. Nothing is scored at request time.
 
-**Candidate generation is deliberately narrow.** Comparing every talk against every other talk is quadratic and wasteful. Candidates are generated only from the selective signals: a shared subtopic, a shared speaker, or a shared network. These have modest fan-out. The broad signals, top-level topics and same-event and same-format, are never used to generate candidates, because a single popular topic attached to hundreds of talks would create hundreds of thousands of pairs on its own. Those broad signals are applied only as decorations on pairs that already exist for a better reason. This keeps the whole recompute cheap even as the catalog grows into the thousands.
+**Candidate generation is deliberately narrow.** Comparing every talk against every other talk is quadratic and wasteful. Two talks are compared only when they share a subtopic or a speaker. Everything else in `R` is a bonus that applies only to pairs that already exist for one of those reasons: top-level topics, the primary topic, same event, same format, and, since v1.4, networks. A tag carried by most of the catalog (on Ethereum TV, the single "Ethereum" network tag produced over a fifth of all compared pairs) would otherwise connect everything to everything and teach the engine nothing. For the same reason a speaker who appears on more than 100 items, in practice a podcast host, adds the speaker bonus but does not make two items a pair on their own. This keeps the whole recompute cheap even as the catalog grows into the tens of thousands.
 
-**No empty states.** Every talk shows related recommendations, always. A talk with fewer than thirteen genuine matches is topped up from a global pool. Thirteen gives a multi-surface consumer enough rows for a nine-item rail and a separately reserved four-item shelf; the stored cap of sixteen leaves some deduplication headroom. The pool is ranked by resonance, not by views, so even the filler tail surfaces quality rather than parading the same few popular talks onto every sparse page.
+**No empty states.** Every talk shows related recommendations, always. A talk with fewer than thirteen genuine matches is topped up in two tiers:
 
-**Freshness of signals.** Recompute the ranking on its own schedule, and refresh it after the periodic sync that updates view and like counts when practical. Keeping an independent refresh prevents a failed upstream statistics sync from leaving newly published items without recommendations. Ethereum TV marks the ranking dirty on catalog changes and checks that state every five minutes, so publication does not wait for a full rebuild and new items receive rows promptly.
+1. **Context first.** Well-received items from the talk's own event (unless the event is a catch-all grouping rather than a real event) and from each of its top-level topics, the top 40 of each by `Q`, of the same content type. They are scored with the same formula; only the bonus signals can apply, because a shared subtopic or speaker would already have made them a match. A talk on the same subject therefore ranks above one that only shares the conference.
+2. **Then the archive's best.** The top 100 talks by `Q`, in an order that is fixed for each page but different from page to page. Before v1.4 this tier was a single sorted list, so a handful of talks sat on thousands of pages; a per-page order spreads them out while staying well-received.
 
-The reference function in [`sql/related_content.sql`](sql/related_content.sql) does all of this in one pass and writes the ordered results to a `related_content` table. See [`examples/TRYIT.md`](examples/TRYIT.md) to run it against a throwaway Postgres with synthetic data in about a minute.
+Thirteen gives a multi-surface consumer enough rows for a nine-item rail and a separately reserved four-item shelf; the stored cap of sixteen leaves some deduplication headroom.
+
+**Freshness of signals.** Recompute the ranking on its own schedule, and refresh it after the periodic sync that updates view and like counts when practical. Keeping an independent refresh prevents a failed upstream statistics sync from leaving newly published items without recommendations. Ethereum TV marks the ranking dirty on catalog changes and checks that state every five minutes, so publication does not wait for a full rebuild and new items receive rows promptly. That scheduling code is part of Ethereum TV's own database, not this repository.
+
+The reference function in [`sql/related_content.sql`](sql/related_content.sql) does all of this in one pass and writes the ordered results to a `related_items` table. See [`examples/TRYIT.md`](examples/TRYIT.md) to run it against a throwaway Postgres with synthetic data in about a minute.
 
 ## The data it expects
 
@@ -141,11 +154,12 @@ The engine needs, per item:
 
 - a set of topic tags, where some tags are subtopics of others (a simple parent link is enough)
 - a designated primary topic
-- a set of contributors (speakers or authors)
-- an optional grouping (an event or a collection) and an optional format
+- a set of contributors (speakers, authors or hosts)
+- an optional grouping (an event or a collection), marked when it is a catch-all bucket rather than a real event, and an optional format
 - an optional ecosystem or network tag
-- a view count and, ideally, a like count
+- a view count when the source has one and, ideally, a like count
 - a date
+- a content type, when the catalog mixes kinds of item
 
 None of these are specific to video. Swap "speaker" for "author", "event" for "issue of a journal", "network" for "product line", and the same model ranks related articles or papers. The signals are the interface, not the domain.
 
@@ -153,7 +167,7 @@ None of these are specific to video. Swap "speaker" for "author", "event" for "i
 
 This is a heuristic, and it is honest about that.
 
-It knows nothing about what a talk is actually about beyond its tags. Two talks can cover the same idea in different words and, if a curator tagged them differently, the engine will not connect them. The weights are hand-chosen and tuned against manual spot checks, not learned. At a small catalog some signals are near universal, for instance almost every talk shares the same top-level network, so they do little discriminating until the catalog diversifies.
+It knows nothing about what a talk is actually about beyond its tags. Two talks can cover the same idea in different words and, if a curator tagged them differently, the engine will not connect them. A talk with no tags at all can only be matched through its speakers, and is otherwise topped up from its event and the archive's best. The weights are hand-chosen and tuned against manual spot checks, not learned. Whether the primary topic should count for less than it does is an open question we are measuring on real pages before changing it.
 
 The planned upgrade is semantic similarity over transcript embeddings, which addresses the "same idea, different words" gap directly. Because everything here sits behind a single precomputed table with a stable shape, that upgrade can land without touching the reading side or the interface. The heuristic and the semantic score can even run together, the heuristic as a fast, explainable baseline and the embedding score as a relevance signal folded into `R`.
 

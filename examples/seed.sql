@@ -64,3 +64,43 @@ insert into item_contributors (item_id, contributor_id) values
 insert into item_networks (item_id, network_id) values
   ('ffffffff-0000-0000-0000-000000000003', 'dddddddd-0000-0000-0000-000000000001'),
   ('ffffffff-0000-0000-0000-000000000011', 'dddddddd-0000-0000-0000-000000000001');
+
+-- v1.4 additions.
+--
+-- A podcast: 105 episodes, one host on all of them (a hub, over the 100-item
+-- threshold), all tagged with one interviews subtopic. On an episode page the
+-- host may hold at most 2 of the top 4 rows and 3 of the top 13.
+insert into topics (id, parent_id) values
+  ('aaaaaaaa-0000-0000-0000-000000000005', null),                                   -- Community (top level)
+  ('aaaaaaaa-0000-0000-0000-000000000006', 'aaaaaaaa-0000-0000-0000-000000000005'); -- interviews (subtopic)
+
+insert into items (id, published, content_type, primary_topic_id, view_count, like_count, published_at)
+select
+  ('ffffffff-0000-0000-0001-' || lpad(i::text, 12, '0'))::uuid,
+  true, 'episode', 'aaaaaaaa-0000-0000-0000-000000000006',
+  20000 + 500 * i, 400 + 7 * i, date '2024-01-01' + i * 3
+from generate_series(1, 105) as i;
+
+insert into item_topics (item_id, topic_id)
+select id, 'aaaaaaaa-0000-0000-0000-000000000006'::uuid from items where content_type = 'episode';
+
+insert into item_contributors (item_id, contributor_id)
+select id, 'cccccccc-0000-0000-0000-000000000002'::uuid from items where content_type = 'episode';
+
+-- One more episode with the same host and no tags. The host alone does not
+-- make it a match for the others, so its page is all top-up.
+insert into items (id, published, content_type, view_count, like_count, published_at) values
+  ('ffffffff-0000-0000-0002-000000000001', true, 'episode', 15000, 300, date '2025-06-01');
+insert into item_contributors (item_id, contributor_id) values
+  ('ffffffff-0000-0000-0002-000000000001', 'cccccccc-0000-0000-0000-000000000002');
+
+-- A catch-all grouping (an uploads bucket) holding a privacy and a scaling
+-- item. They are not offered to each other as same-event top-up.
+insert into events (id, start_date, is_catch_all) values
+  ('eeeeeeee-0000-0000-0000-000000000002', null, true);
+update items set event_id = 'eeeeeeee-0000-0000-0000-000000000002'
+where id in ('ffffffff-0000-0000-0000-000000000004', 'ffffffff-0000-0000-0000-000000000012');
+
+-- A talk whose source has no view counter: unknown reach (0.5), not zero.
+update items set view_count = null, like_count = null
+where id = 'ffffffff-0000-0000-0000-000000000013';
