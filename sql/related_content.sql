@@ -359,80 +359,87 @@ begin
       or b_type <> secondary_type
       or type_rank <= secondary_rail_cap
   ),
-  -- v1.4 speaker spread: k is a row's place, by score, among the rows that
-  -- share the same contributor with the anchor (its worst such place).
-  spread as (
-    select x.a_id, x.b_id, max(x.k) as k
-    from (
-      select c.a_id, c.b_id,
-        row_number() over (
-          partition by c.a_id, ca.contributor_id order by c.score_num desc, c.b_id
-        ) as k
-      from capped c
-      join contributors ca on ca.item_id = c.a_id
-      join contributors cb on cb.item_id = c.b_id and cb.contributor_id = ca.contributor_id
-      where c.shares_contributor
-    ) x
-    group by x.a_id, x.b_id
+  -- v1.4 contributor spread. One row per (anchor, related, shared contributor),
+  -- with k the row's place by score among the anchor's rows sharing that
+  -- contributor. A row's k is its worst place over its shared contributors.
+  spread_rows as materialized (
+    select c.a_id, c.b_id, ca.contributor_id,
+      row_number() over (
+        partition by c.a_id, ca.contributor_id order by c.score_num desc, c.b_id
+      ) as k
+    from capped c
+    join contributors ca on ca.item_id = c.a_id
+    join contributors cb
+      on cb.item_id = c.b_id and cb.contributor_id = ca.contributor_id
+    where c.shares_contributor
   ),
   genuine as materialized (
     select c.a_id, c.b_id, c.score_num, coalesce(s.k, 0) as k
     from capped c
-    left join spread s on s.a_id = c.a_id and s.b_id = c.b_id
+    left join (
+      select a_id, b_id, max(k) as k from spread_rows group by a_id, b_id
+    ) s on s.a_id = c.a_id and s.b_id = c.b_id
   ),
-  -- Ranks 1 to 4 take rows with k <= 2, ranks 5 to 13 rows with k <= 3, best
-  -- score first; fill completes a band the genuine rows cannot. Ranks 14 to
-  -- 16 take the best remaining genuine rows.
-  band_a as materialized (
-    select a_id, b_id, score_num, pos from (
-      select a_id, b_id, score_num,
-        row_number() over (partition by a_id order by score_num desc, b_id) as pos
-      from genuine where k <= 2
-    ) x where pos <= 4
+  -- The bands below can only ever use a genuine row among the best 16
+  -- with k <= 2, the best 12 with k = 3 or the best 3 with k >= 4, so
+  -- they read at most 31 genuine rows per anchor.
+  shortlist as materialized (
+    select a_id, b_id, score_num, k from (
+      select a_id, b_id, score_num, k,
+        row_number() over (
+          partition by a_id, case when k <= 2 then 0 when k = 3 then 1 else 2 end
+          order by score_num desc, b_id
+        ) as class_pos
+      from genuine
+    ) x
+    where (k <= 2 and class_pos <= 16) or (k = 3 and class_pos <= 12)
+      or (k >= 4 and class_pos <= 3)
   ),
-  band_b as materialized (
-    select a_id, b_id, score_num, pos from (
-      select g.a_id, g.b_id, g.score_num,
-        row_number() over (partition by g.a_id order by g.score_num desc, g.b_id) as pos
-      from genuine g
-      where g.k <= 3
-        and not exists (select 1 from band_a x where x.a_id = g.a_id and x.b_id = g.b_id)
-    ) y where pos <= 9
-  ),
-  band_c as (
-    select a_id, b_id, score_num, pos from (
-      select g.a_id, g.b_id, g.score_num,
-        row_number() over (partition by g.a_id order by g.score_num desc, g.b_id) as pos
-      from genuine g
-      where not exists (select 1 from band_a x where x.a_id = g.a_id and x.b_id = g.b_id)
-        and not exists (select 1 from band_b x where x.a_id = g.a_id and x.b_id = g.b_id)
-    ) z where pos <= 3
-  ),
+  -- Ranks 1 to 4 take rows with k <= 2 and ranks 5 to 13 rows with
+  -- k <= 3. An anchor needs fill when its genuine rows cannot fill both.
   need as materialized (
     select q.id as a_id, q.content_type, q.primary_topic_id, q.event_id,
-      q.context_event_id, q.format_id,
-      coalesce(na.n, 0) as n_a, coalesce(nb.n, 0) as n_b,
-      4 - coalesce(na.n, 0) as need_a, 9 - coalesce(nb.n, 0) as need_b
+      q.context_event_id, q.format_id
     from qfinal q
-    left join (select a_id, count(*) as n from band_a group by a_id) na on na.a_id = q.id
-    left join (select a_id, count(*) as n from band_b group by a_id) nb on nb.a_id = q.id
-    where coalesce(na.n, 0) + coalesce(nb.n, 0) < 13
+    left join (
+      select a_id, count(*) filter (where k <= 2) as k2,
+        count(*) filter (where k <= 3) as k3
+      from shortlist group by a_id
+    ) c on c.a_id = q.id
+    where coalesce(c.k2, 0) < 4
+      or coalesce(c.k3, 0) - least(coalesce(c.k2, 0), 4) < 9
   ),
-  context as (
-    select n.a_id, p.id as b_id
-    from need n
-    join pool p
-      on p.tier = 1 and p.key = n.context_event_id and p.content_type = n.content_type
-    union
-    select n.a_id, p.id
-    from need n
-    join topic_sets ts on ts.item_id = n.a_id
-    cross join unnest(ts.top_ids) as top(topic_id)
-    join pool p on p.tier = 2 and p.key = top.topic_id and p.content_type = n.content_type
+  -- Fill pairs: tier 1 context (event, top-level topics), tier 2 global.
+  -- An anchor's genuine rows enter as tier 0 so the distinct below drops
+  -- them from fill without an anti-join against every candidate.
+  fill_pairs as (
+    select distinct on (a_id, b_id) a_id, b_id, tier
+    from (
+      select g.a_id, g.b_id, 0 as tier
+      from genuine g join need n on n.a_id = g.a_id
+      union all
+      select n.a_id, p.id, 1
+      from need n
+      join pool p
+        on p.tier = 1 and p.key = n.context_event_id and p.content_type = n.content_type
+      union all
+      select n.a_id, p.id, 1
+      from need n
+      join topic_sets ts on ts.item_id = n.a_id
+      cross join unnest(ts.top_ids) as top(topic_id)
+      join pool p
+        on p.tier = 2 and p.key = top.topic_id and p.content_type = n.content_type
+      union all
+      select n.a_id, p.id, 2
+      from need n
+      join pool p on p.tier = 3
+    ) pairs
+    where b_id <> a_id
+    order by a_id, b_id, tier
   ),
   -- Context rows use the same R as genuine rows. A shared subtopic or a
-  -- shared non-hub contributor would have made the pair a candidate, so only
-  -- the bonus signals can apply here.
+  -- shared non-hub contributor would have made the pair genuine, so only the
+  -- bonus signals can apply here (a hub contributor's +5 included).
   context_scored as (
     select x.a_id, x.b_id,
       (
@@ -441,38 +448,32 @@ begin
             where topic_id = any(mb.top_ids)), 0), 2)
         + case when n.primary_topic_id is not null and n.primary_topic_id = qb.primary_topic_id then 3.0 else 0 end
         + case when exists (
-            select 1 from contributors ca
-            join contributors cb on cb.contributor_id = ca.contributor_id and cb.item_id = x.b_id
+            select 1
+            from contributors ca
+            join contributors cb
+              on cb.contributor_id = ca.contributor_id and cb.item_id = x.b_id
             where ca.item_id = x.a_id
           ) then 5.0 else 0 end
         + case when exists (
-            select 1 from networks na
-            join networks nb on nb.network_id = na.network_id and nb.item_id = x.b_id
+            select 1
+            from networks na
+            join networks nb
+              on nb.network_id = na.network_id and nb.item_id = x.b_id
             where na.item_id = x.a_id
           ) then 2.0 else 0 end
         + case when n.event_id is not null and n.event_id = qb.event_id then 1.0 else 0 end
         + case when n.format_id is not null and n.format_id = qb.format_id then 0.5 else 0 end
       ) * (1 + 0.6 * qb.qv) as score_num
-    from context x
+    from fill_pairs x
     join need n on n.a_id = x.a_id
     join qfinal qb on qb.id = x.b_id
     left join topic_sets ma on ma.item_id = x.a_id
     left join topic_sets mb on mb.item_id = x.b_id
-    where x.b_id <> x.a_id
-      and not exists (select 1 from genuine g where g.a_id = x.a_id and g.b_id = x.b_id)
+    where x.tier = 1
   ),
-  fill_pool as (
-    select a_id, b_id, score_num, 1 as tier from context_scored
-    union all
-    select n.a_id, p.id, p.qv, 2
-    from need n
-    join pool p on p.tier = 3
-    where p.id <> n.a_id
-      and not exists (select 1 from genuine g where g.a_id = n.a_id and g.b_id = p.id)
-  ),
-  -- Context by score; the global tier in a per-anchor order (md5 of the
-  -- pair), so no single item tops every sparse page.
-  fill_ranked as (
+  -- Context by score; the global tier in a per-page order (md5 of the
+  -- pair), so no single talk tops every sparse page.
+  fill_ranked as materialized (
     select f.a_id, f.b_id, f.score_num,
       row_number() over (
         partition by f.a_id
@@ -481,29 +482,76 @@ begin
           md5(f.a_id::text || f.b_id::text)
       ) as fpos
     from (
-      select distinct on (a_id, b_id) a_id, b_id, score_num, tier
-      from fill_pool
-      order by a_id, b_id, tier
+      select a_id, b_id, score_num, 1 as tier from context_scored
+      union all
+      select x.a_id, x.b_id, qb.qv, 2
+      from fill_pairs x
+      join qfinal qb on qb.id = x.b_id
+      where x.tier = 2
     ) f
   ),
-  placed as (
-    select a_id, b_id, score_num, 1 as band, pos from band_a
+  -- Spread covers fill too: a fill row's place among the rows sharing a
+  -- contributor continues after every genuine row sharing that contributor.
+  fill_k as (
+    select x.a_id, x.b_id, max(x.k) as k
+    from (
+      select f.a_id, f.b_id,
+        coalesce(gc.n, 0) + row_number() over (
+          partition by f.a_id, ca.contributor_id order by f.fpos
+        ) as k
+      from fill_ranked f
+      join contributors ca on ca.item_id = f.a_id
+      join contributors cb
+        on cb.item_id = f.b_id and cb.contributor_id = ca.contributor_id
+      left join (
+        select a_id, contributor_id, count(*) as n from spread_rows group by a_id, contributor_id
+      ) gc on gc.a_id = f.a_id and gc.contributor_id = ca.contributor_id
+    ) x
+    group by x.a_id, x.b_id
+  ),
+  -- Every row an anchor may place: genuine rows by score, then fill.
+  ordered as materialized (
+    select a_id, b_id, score_num, false as filled, k, 0 as src,
+      row_number() over (partition by a_id order by score_num desc, b_id) as seq
+    from shortlist
     union all
-    select a_id, b_id, score_num, 2, pos from band_b
-    union all
-    select f.a_id, f.b_id, f.score_num,
-      case when f.fpos <= n.need_a then 1 else 2 end,
-      case when f.fpos <= n.need_a then n.n_a + f.fpos else n.n_b + f.fpos - n.need_a end
+    select f.a_id, f.b_id, f.score_num, true, coalesce(fk.k, 0), 1, f.fpos
     from fill_ranked f
-    join need n on n.a_id = f.a_id
-    where f.fpos <= n.need_a + n.need_b
-    union all
-    select a_id, b_id, score_num, 3, pos from band_c
+    left join fill_k fk on fk.a_id = f.a_id and fk.b_id = f.b_id
+  ),
+  band_a as materialized (
+    select a_id, b_id from (
+      select a_id, b_id, row_number() over (partition by a_id order by src, seq) as pos
+      from ordered where k <= 2
+    ) x where pos <= 4
+  ),
+  band_b as materialized (
+    select a_id, b_id from (
+      select o.a_id, o.b_id, row_number() over (partition by o.a_id order by o.src, o.seq) as pos
+      from ordered o
+      where o.k <= 3
+        and not exists (select 1 from band_a x where x.a_id = o.a_id and x.b_id = o.b_id)
+    ) y where pos <= 9
+  ),
+  -- Ranks 14 to 16: the best remaining genuine rows (fill tops up to 13 only).
+  band_c as (
+    select a_id, b_id from (
+      select o.a_id, o.b_id, row_number() over (partition by o.a_id order by o.src, o.seq) as pos
+      from ordered o
+      where o.src = 0
+        and not exists (select 1 from band_a x where x.a_id = o.a_id and x.b_id = o.b_id)
+        and not exists (select 1 from band_b x where x.a_id = o.a_id and x.b_id = o.b_id)
+    ) z where pos <= 3
   ),
   ranked as (
-    select a_id, b_id, score_num,
-      row_number() over (partition by a_id order by band, pos, b_id) as rank
-    from placed
+    select o.a_id, o.b_id, o.score_num, o.filled,
+      row_number() over (partition by o.a_id order by p.band, o.src, o.seq) as rank
+    from (
+      select a_id, b_id, 1 as band from band_a
+      union all select a_id, b_id, 2 from band_b
+      union all select a_id, b_id, 3 from band_c
+    ) p
+    join ordered o on o.a_id = p.a_id and o.b_id = p.b_id
   )
   insert into related_items (item_id, related_item_id, score, rank)
   select a_id, b_id, score_num::real, rank::smallint
